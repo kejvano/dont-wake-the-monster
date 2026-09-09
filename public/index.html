@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="sv">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <title>Don't Wake the Monster</title>
@@ -13,62 +13,72 @@
   <script src="/socket.io/socket.io.js"></script>
   <script>
     const socket = io();
-    const sprites = {};
+    const sprites = {}; // socket id -> player rectangle
 
     class GameScene extends Phaser.Scene {
       create() {
         this.keys = this.input.keyboard.addKeys("W,A,S,D,UP,DOWN,LEFT,RIGHT,SHIFT,R,E");
+        this.wallSprites = [];
 
-        // Utgång (ritas först så den hamnar under allt annat)
+        // Draw order matters: exit first so everything else sits on top
         this.exit = this.add.rectangle(0, 0, 10, 10, 0x1b5e20);
-        this.exitText = this.add.text(0, 0, "UTGÅNG", { fontSize: "14px", color: "#8f8" }).setOrigin(0.5);
+        this.exitText = this.add.text(0, 0, "EXIT", { fontSize: "14px", color: "#8f8" }).setOrigin(0.5);
 
-        // Loot
         this.loot = this.add.rectangle(0, 0, 20, 20, 0xffeb3b);
         this.lootText = this.add.text(0, 0, "", { fontSize: "12px", color: "#ff9" }).setOrigin(0.5);
 
-        // Monster
-        this.monster = this.add.rectangle(700, 100, 48, 48, 0xd32f2f);
+        this.monster = this.add.rectangle(0, 0, 48, 48, 0xd32f2f);
         this.monsterText = this.add.text(0, 0, "", { fontSize: "14px", color: "#fff" }).setOrigin(0.5);
 
-        // Noise meter
         this.add.text(20, 15, "NOISE", { fontSize: "16px", color: "#fff" });
         this.add.rectangle(80, 24, 300, 16, 0x333333).setOrigin(0, 0.5);
         this.noiseBar = this.add.rectangle(80, 24, 0, 16, 0xffc107).setOrigin(0, 0.5);
 
-        this.hint = this.add.text(400, 580, "WASD: gå · Shift: spring · E: plocka upp/släpp", { fontSize: "13px", color: "#888" }).setOrigin(0.5);
+        this.add.text(400, 580, "WASD: walk · Shift: run · E: pick up/drop", { fontSize: "13px", color: "#888" }).setOrigin(0.5);
         this.bigText = this.add.text(400, 300, "", { fontSize: "40px", color: "#fff", align: "center" }).setOrigin(0.5);
 
-        socket.on("state", (state) => {
-          for (const id in state.players) {
-            if (!sprites[id]) {
-              const color = id === socket.id ? 0x4caf50 : 0x2196f3;
-              sprites[id] = this.add.rectangle(0, 0, 32, 32, color);
-            }
-            sprites[id].setPosition(state.players[id].x, state.players[id].y);
+        socket.on("state", (state) => this.applyState(state));
+      }
+
+      applyState(state) {
+        // Walls never change, so only draw them once
+        if (this.wallSprites.length === 0) {
+          for (const w of state.walls) {
+            this.wallSprites.push(this.add.rectangle(w.x, w.y, w.w, w.h, 0x555555).setOrigin(0, 0));
           }
-          for (const id in sprites) {
-            if (!state.players[id]) { sprites[id].destroy(); delete sprites[id]; }
+        }
+
+        for (const id in state.players) {
+          if (!sprites[id]) {
+            const color = id === socket.id ? 0x4caf50 : 0x2196f3;
+            sprites[id] = this.add.rectangle(0, 0, 32, 32, color);
           }
+          sprites[id].setPosition(state.players[id].x, state.players[id].y);
+        }
+        for (const id in sprites) {
+          if (!state.players[id]) {
+            sprites[id].destroy();
+            delete sprites[id];
+          }
+        }
 
-          this.exit.setPosition(state.exit.x, state.exit.y).setSize(state.exit.w, state.exit.h);
-          this.exitText.setPosition(state.exit.x, state.exit.y);
+        this.exit.setPosition(state.exit.x, state.exit.y).setSize(state.exit.w, state.exit.h);
+        this.exitText.setPosition(state.exit.x, state.exit.y);
 
-          this.loot.setPosition(state.loot.x, state.loot.y);
-          this.lootText.setPosition(state.loot.x, state.loot.y - 18);
-          this.lootText.setText(state.loot.carriedBy ? "" : state.loot.name);
+        this.loot.setPosition(state.loot.x, state.loot.y);
+        this.lootText.setPosition(state.loot.x, state.loot.y - 18);
+        this.lootText.setText(state.loot.carriedBy ? "" : state.loot.name);
 
-          this.monster.setPosition(state.monster.x, state.monster.y);
-          this.monsterText.setPosition(state.monster.x, state.monster.y - 40);
-          this.monsterText.setText(state.monster.status === "SLEEPING" ? "zzz" : state.monster.status);
+        this.monster.setPosition(state.monster.x, state.monster.y);
+        this.monsterText.setPosition(state.monster.x, state.monster.y - 40);
+        this.monsterText.setText(state.monster.status === "SLEEPING" ? "zzz" : state.monster.status);
 
-          this.noiseBar.width = state.noise * 3;
-          this.noiseBar.fillColor = state.noise > 50 ? 0xf44336 : 0xffc107;
+        this.noiseBar.width = state.noise * 3;
+        this.noiseBar.fillColor = state.noise > 50 ? 0xf44336 : 0xffc107;
 
-          if (!state.gameOver) this.bigText.setText("");
-          else if (state.result === "WIN") this.bigText.setText("NI KOM UNDAN!\nTryck R");
-          else this.bigText.setText("WHO WOKE ME?\nGame over – tryck R");
-        });
+        if (!state.gameOver) this.bigText.setText("");
+        else if (state.result === "WIN") this.bigText.setText("YOU GOT AWAY!\nPress R");
+        else this.bigText.setText("WHO WOKE ME?\nGame over – press R");
       }
 
       update() {
