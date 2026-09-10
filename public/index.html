@@ -17,15 +17,15 @@
 
     class GameScene extends Phaser.Scene {
       create() {
-        this.keys = this.input.keyboard.addKeys("W,A,S,D,UP,DOWN,LEFT,RIGHT,SHIFT,R,E");
+        this.keys = this.input.keyboard.addKeys("W,A,S,D,UP,DOWN,LEFT,RIGHT,SHIFT,R,E,L");
         this.wallSprites = [];
 
         // Draw order matters: exit first so everything else sits on top
         this.exit = this.add.rectangle(0, 0, 10, 10, 0x1b5e20);
         this.exitText = this.add.text(0, 0, "EXIT", { fontSize: "14px", color: "#8f8" }).setOrigin(0.5);
 
-        this.loot = this.add.rectangle(0, 0, 20, 20, 0xffeb3b);
-        this.lootText = this.add.text(0, 0, "", { fontSize: "12px", color: "#ff9" }).setOrigin(0.5);
+        this.lootSprites = {}; // loot index -> { box, label }
+        this.scoreText = this.add.text(780, 15, "", { fontSize: "16px", color: "#ffeb3b" }).setOrigin(1, 0);
 
         this.monster = this.add.rectangle(0, 0, 48, 48, 0xd32f2f);
         this.monsterText = this.add.text(0, 0, "", { fontSize: "14px", color: "#fff" }).setOrigin(0.5);
@@ -34,17 +34,20 @@
         this.add.rectangle(80, 24, 300, 16, 0x333333).setOrigin(0, 0.5);
         this.noiseBar = this.add.rectangle(80, 24, 0, 16, 0xffc107).setOrigin(0, 0.5);
 
-        this.add.text(400, 580, "WASD: walk · Shift: run · E: pick up/drop", { fontSize: "13px", color: "#888" }).setOrigin(0.5);
+        this.add.text(400, 580, "WASD: walk · Shift: run · E: pick up/drop · L: leave (in exit)", { fontSize: "13px", color: "#888" }).setOrigin(0.5);
         this.bigText = this.add.text(400, 300, "", { fontSize: "40px", color: "#fff", align: "center" }).setOrigin(0.5);
 
         socket.on("state", (state) => this.applyState(state));
       }
 
       applyState(state) {
-        // Walls never change, so only draw them once
+        // Walls and doors never change, so only draw them once
         if (this.wallSprites.length === 0) {
           for (const w of state.walls) {
             this.wallSprites.push(this.add.rectangle(w.x, w.y, w.w, w.h, 0x555555).setOrigin(0, 0));
+          }
+          for (const d of state.doors) {
+            this.wallSprites.push(this.add.rectangle(d.x, d.y, d.w, d.h, 0x6d4c41, 0.5).setOrigin(0, 0));
           }
         }
 
@@ -62,12 +65,23 @@
           }
         }
 
+        state.loot.forEach((item, i) => {
+          if (!this.lootSprites[i]) {
+            this.lootSprites[i] = {
+              box: this.add.rectangle(0, 0, 20, 20, 0xffeb3b),
+              label: this.add.text(0, 0, "", { fontSize: "12px", color: "#ff9" }).setOrigin(0.5),
+            };
+          }
+          const s = this.lootSprites[i];
+          s.box.setVisible(!item.secured);
+          s.label.setVisible(!item.secured && !item.carriedBy);
+          s.box.setPosition(item.x, item.y);
+          s.label.setPosition(item.x, item.y - 18).setText(`${item.name} ($${item.value})`);
+        });
+        this.scoreText.setText("SCORE: $" + state.score);
+
         this.exit.setPosition(state.exit.x, state.exit.y).setSize(state.exit.w, state.exit.h);
         this.exitText.setPosition(state.exit.x, state.exit.y);
-
-        this.loot.setPosition(state.loot.x, state.loot.y);
-        this.lootText.setPosition(state.loot.x, state.loot.y - 18);
-        this.lootText.setText(state.loot.carriedBy ? "" : state.loot.name);
 
         this.monster.setPosition(state.monster.x, state.monster.y);
         this.monsterText.setPosition(state.monster.x, state.monster.y - 40);
@@ -77,7 +91,7 @@
         this.noiseBar.fillColor = state.noise > 50 ? 0xf44336 : 0xffc107;
 
         if (!state.gameOver) this.bigText.setText("");
-        else if (state.result === "WIN") this.bigText.setText("YOU GOT AWAY!\nPress R");
+        else if (state.result === "WIN") this.bigText.setText(`YOU GOT AWAY!\n$${state.score}\nPress R`);
         else this.bigText.setText("WHO WOKE ME?\nGame over – press R");
       }
 
@@ -91,6 +105,7 @@
           run: k.SHIFT.isDown,
         });
         if (Phaser.Input.Keyboard.JustDown(k.E)) socket.emit("interact");
+        if (Phaser.Input.Keyboard.JustDown(k.L)) socket.emit("leave");
         if (Phaser.Input.Keyboard.JustDown(k.R)) socket.emit("restart");
       }
     }
