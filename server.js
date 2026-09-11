@@ -17,6 +17,11 @@ const NOISE_DECAY = 0.25;
 const PICKUP_RANGE = 40;
 const PLAYER_SIZE = 32;
 const TICK_RATE = 30;
+const MONSTER_INVESTIGATE_SPEED = 1;
+const MONSTER_CHASE_SPEED = 4;   // slower than running, faster than walking
+const MONSTER_SIZE = 48;
+const CATCH_RANGE = 30;
+const MONSTER_HOME = { x: 600, y: 120 };
 
 const EXIT = { x: 40, y: 520, w: 120, h: 60 };
 
@@ -64,7 +69,7 @@ const LOOT_TEMPLATES = [
 // The server owns all game state. Clients only send input and render.
 const state = {
   players: {},
-  monster: { x: 600, y: 120, status: "SLEEPING" },
+  monster: { x: MONSTER_HOME.x, y: MONSTER_HOME.y, status: "SLEEPING", target: null },
   loot: [],
   score: 0,
   noise: 0,
@@ -102,7 +107,7 @@ function resetGame() {
   state.score = 0;
   state.gameOver = false;
   state.result = null;
-  state.monster.status = "SLEEPING";
+  state.monster = { x: MONSTER_HOME.x, y: MONSTER_HOME.y, status: "SLEEPING", target: null };
   state.loot = LOOT_TEMPLATES.map((t) => ({ ...t, carriedBy: null, secured: false }));
   for (const id in state.players) spawnPlayer(state.players[id]);
 }
@@ -112,8 +117,12 @@ resetGame();
 io.on("connection", (socket) => {
   console.log("Player connected:", socket.id);
 
+  // First player to join becomes the lookout, second the thief.
+  // Extra players get "thief" so the game still works with spectators.
+  const hasLookout = Object.values(state.players).some((p) => p.role === "lookout");
   state.players[socket.id] = {
     x: 0, y: 0,
+    role: hasLookout ? "thief" : "lookout",
     keys: { up: false, down: false, left: false, right: false, run: false },
     carrying: -1, // index into state.loot, -1 when hands are empty
     inDoor: -1,   // index of the door zone the player is currently in
@@ -181,10 +190,129 @@ io.on("connection", (socket) => {
   });
 });
 
+// Same wall check as players, just a bigger body
+function monsterCollides(x, y) {
+  const half = MONSTER_SIZE / 2;
+  return WALLS.some((w) =>
+    x + half > w.x && x - half < w.x + w.w && y + half > w.y && y - half < w.y + w.h
+  );
+}
+
+// Step towards a point, axis by axis so it slides along walls.
+// Callers pass the next pathfinding cell rather than the final target.
+function moveMonsterTowards(target, speed) {
+  const m = state.monster;
+  const dx = target.x - m.x, dy = target.y - m.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 1) return;
+
+  const oldX = m.x, oldY = m.y;
+  m.x += (dx / dist) * speed;
+  if (monsterCollides(m.x, m.y)) m.x = oldX;
+  m.y += (dy / dist) * speed;
+  if (monsterCollides(m.x, m.y)) m.y = oldY;
+}
+
+function nearestPlayer() {
+  let best = null, bestDist = Infinity;
+  for (const id in state.players) {
+    const p = state.players[id];
+    const dist = Math.hypot(p.x - state.monster.x, p.y - state.monster.y);
+    if (dist < bestDist) { best = p; bestDist = dist; }
+  }
+  return best;
+}
+
+// Grid-based pathfinding (BFS). The house is small enough that
+// recomputing the path every tick is cheap.
+const CELL = 20;
+const GRID_W = 800 / CELL;
+const GRID_H = 600 / CELL;
+
+// Precompute which cells the monster's body fits in
+const walkable = [];
+for (let cy = 0; cy < GRID_H; cy++) {
+  walkable[cy] = [];
+  for (let cx = 0; cx < GRID_W; cx++) {
+    walkable[cy][cx] = !monsterCollides(cx * CELL + CELL / 2, cy * CELL + CELL / 2);
+  }
+}
+
+function toCell(pos) {
+  return {
+    cx: Math.max(0, Math.min(GRID_W - 1, Math.floor(pos.x / CELL))),
+    cy: Math.max(0, Math.min(GRID_H - 1, Math.floor(pos.y / CELL))),
+  };
+}
+
+// Returns the world position of the next cell to move to, or the target
+// itself if it's already in reach. If the target cell is unreachable
+// (players are smaller and can hug walls), aim for the closest reachable one.
+function nextStepTowards(target) {
+  const start = toCell(state.monster);
+  const goal = toCell(target);
+  if (start.cx === goal.cx && start.cy === goal.cy) return target;
+
+  const key = (c) => c.cy * GRID_W + c.cx;
+  const cameFrom = new Map([[key(start), null]]);
+  const queue = [start];
+  let closest = start, closestDist = Infinity;
+
+  while (queue.length > 0) {
+    const cur = queue.shift();
+    const d = Math.hypot(cur.cx - goal.cx, cur.cy - goal.cy);
+    if (d < closestDist) { closest = cur; closestDist = d; }
+    if (d === 0) break;
+
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const next = { cx: cur.cx + dx, cy: cur.cy + dy };
+      if (next.cx < 0 || next.cy < 0 || next.cx >= GRID_W || next.cy >= GRID_H) continue;
+      if (!walkable[next.cy][next.cx] || cameFrom.has(key(next))) continue;
+      cameFrom.set(key(next), cur);
+      queue.push(next);
+    }
+  }
+
+  // Walk the path backwards from the goal to find the first step
+  let step = closest;
+  while (cameFrom.get(key(step)) && key(cameFrom.get(key(step))) !== key(start)) {
+    step = cameFrom.get(key(step));
+  }
+  return { x: step.cx * CELL + CELL / 2, y: step.cy * CELL + CELL / 2 };
+}
+
+function updateMonster() {
+  const m = state.monster;
+
+  if (m.status === "CHASING") {
+    const prey = nearestPlayer();
+    if (!prey) return;
+    moveMonsterTowards(nextStepTowards(prey), MONSTER_CHASE_SPEED);
+    if (Math.hypot(prey.x - m.x, prey.y - m.y) < CATCH_RANGE) {
+      state.gameOver = true;
+      state.result = "LOSE";
+    }
+    return;
+  }
+
+  // Once awake it never goes back to sleep
+  if (state.noise >= 100) {
+    m.status = "CHASING";
+  } else if (state.noise >= 75) {
+    m.status = "INVESTIGATING";
+    if (m.target) moveMonsterTowards(nextStepTowards(m.target), MONSTER_INVESTIGATE_SPEED);
+  } else if (state.noise >= 50) {
+    m.status = "DISTURBED";
+  } else {
+    m.status = "SLEEPING";
+  }
+}
+
 function tick() {
   if (state.gameOver) return;
 
   let noiseThisTick = 0;
+  let loudest = { amount: 0, pos: null };
 
   for (const id in state.players) {
     const p = state.players[id];
@@ -205,15 +333,19 @@ function tick() {
 
     // Noise burst when a player enters a door zone they weren't in before
     const door = doorAt(p.x, p.y);
+
+    let playerNoise = 0;
     if (door !== -1 && door !== p.inDoor) {
-      noiseThisTick += k.run ? DOOR_RUN_NOISE : DOOR_WALK_NOISE;
+      playerNoise += k.run ? DOOR_RUN_NOISE : DOOR_WALK_NOISE;
     }
     p.inDoor = door;
 
     if (moving) {
-      noiseThisTick += k.run ? RUN_NOISE : WALK_NOISE;
-      if (item) noiseThisTick += item.noise;
+      playerNoise += k.run ? RUN_NOISE : WALK_NOISE;
+      if (item) playerNoise += item.noise;
     }
+    noiseThisTick += playerNoise;
+    if (playerNoise > loudest.amount) loudest = { amount: playerNoise, pos: { x: p.x, y: p.y } };
 
     if (item) {
       item.x = p.x;
@@ -222,21 +354,30 @@ function tick() {
   }
 
   state.noise = Math.max(0, Math.min(100, state.noise + noiseThisTick - NOISE_DECAY));
+  if (loudest.pos) state.monster.target = loudest.pos;
 
-  if (state.noise >= 100) {
-    state.monster.status = "AWAKE";
-    state.gameOver = true;
-    state.result = "LOSE";
-  } else if (state.noise >= 50) {
-    state.monster.status = "DISTURBED";
+  updateMonster();
+}
+
+// Each role gets a different view of the world. This is the core of the
+// game: neither player has the full picture, so they have to talk.
+function viewFor(role) {
+  const view = { ...state, exit: EXIT, walls: WALLS, doors: DOORS, role };
+
+  if (role === "thief") {
+    view.monster = null;
+    view.noise = null;
   } else {
-    state.monster.status = "SLEEPING";
+    view.loot = state.loot.map((item) => ({ ...item, name: "???", value: null }));
   }
+  return view;
 }
 
 setInterval(() => {
   tick();
-  io.emit("state", { ...state, exit: EXIT, walls: WALLS, doors: DOORS });
+  for (const id in state.players) {
+    io.to(id).emit("state", viewFor(state.players[id].role));
+  }
 }, 1000 / TICK_RATE);
 
 const PORT = process.env.PORT || 3000;

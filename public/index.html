@@ -37,6 +37,8 @@
         this.add.text(400, 580, "WASD: walk · Shift: run · E: pick up/drop · L: leave (in exit)", { fontSize: "13px", color: "#888" }).setOrigin(0.5);
         this.bigText = this.add.text(400, 300, "", { fontSize: "40px", color: "#fff", align: "center" }).setOrigin(0.5);
 
+        this.roleText = this.add.text(400, 15, "", { fontSize: "16px", color: "#fff" }).setOrigin(0.5, 0);
+
         socket.on("state", (state) => this.applyState(state));
       }
 
@@ -76,23 +78,35 @@
           s.box.setVisible(!item.secured);
           s.label.setVisible(!item.secured && !item.carriedBy);
           s.box.setPosition(item.x, item.y);
-          s.label.setPosition(item.x, item.y - 18).setText(`${item.name} ($${item.value})`);
+                    s.label.setPosition(item.x, item.y - 18).setText(item.value === null ? "?" : `${item.name} ($${item.value})`);
         });
-        this.scoreText.setText("SCORE: $" + state.score);
 
         this.exit.setPosition(state.exit.x, state.exit.y).setSize(state.exit.w, state.exit.h);
         this.exitText.setPosition(state.exit.x, state.exit.y);
 
-        this.monster.setPosition(state.monster.x, state.monster.y);
-        this.monsterText.setPosition(state.monster.x, state.monster.y - 40);
-        this.monsterText.setText(state.monster.status === "SLEEPING" ? "zzz" : state.monster.status);
+        this.roleText.setText(state.role === "lookout" ? "LOOKOUT – you see the monster" : "THIEF – you see the loot");
 
-        this.noiseBar.width = state.noise * 3;
-        this.noiseBar.fillColor = state.noise > 50 ? 0xf44336 : 0xffc107;
+        const seesMonster = state.monster !== null;
+        this.monster.setVisible(seesMonster);
+        this.monsterText.setVisible(seesMonster);
+        if (seesMonster) {
+          this.monster.setPosition(state.monster.x, state.monster.y);
+          this.monsterText.setPosition(state.monster.x, state.monster.y - 40);
+          this.monsterText.setText(state.monster.status === "SLEEPING" ? "zzz" : state.monster.status);
+        }
+
+        const seesNoise = state.noise !== null;
+        this.noiseBar.setVisible(seesNoise);
+        if (seesNoise) {
+          this.noiseBar.width = state.noise * 3;
+          this.noiseBar.fillColor = state.noise > 50 ? 0xf44336 : 0xffc107;
+        }
+
+        this.scoreText.setText("SCORE: $" + state.score);
 
         if (!state.gameOver) this.bigText.setText("");
         else if (state.result === "WIN") this.bigText.setText(`YOU GOT AWAY!\n$${state.score}\nPress R`);
-        else this.bigText.setText("WHO WOKE ME?\nGame over – press R");
+        else this.bigText.setText("WHO WOKE ME?\nYou got caught – press R");
       }
 
       update() {
