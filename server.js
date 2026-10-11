@@ -12,6 +12,7 @@ const TICK_RATE = 30;
 const W = 800, H = 600;
 
 // --- Players -----------------------------------------------------------
+const SNEAK_SPEED = 1;
 const WALK_SPEED = 2;
 const RUN_SPEED = 4.2;
 const GHOST_SPEED = 2.5;
@@ -26,23 +27,36 @@ const PLAYER_COLORS = [0x4caf50, 0x42a5f5, 0xffa726, 0xec407a, 0xab47bc, 0x26c6d
 // --- Noise -------------------------------------------------------------
 // Noise is local: every sound is a ring with a radius. The monster only
 // hears rings that reach it, and every wall in between halves the radius.
-const WALK_STEP_EVERY = 16;  // ticks between footsteps
+// Sneaking is the "correct" way to move. Walking is heard across a room,
+// running across the house.
+const SNEAK_STEP_EVERY = 22; // ticks between footsteps
+const WALK_STEP_EVERY = 16;
 const RUN_STEP_EVERY = 8;
-const WALK_STEP_RADIUS = 55;
-const RUN_STEP_RADIUS = 190;
+const SNEAK_STEP_RADIUS = 20;
+const WALK_STEP_RADIUS = 180;
+const RUN_STEP_RADIUS = 300;
 const DOOR_CREAK_RADIUS = 110;   // opening a door carefully
-const DOOR_SLAM_RADIUS = 350;    // running into a closed door
+const DOOR_SLAM_RADIUS = 500;    // running into a closed door
 const DOOR_CLOSE_RADIUS = 80;
 const MONSTER_DOOR_RADIUS = 220; // only drawn, it doesn't hear itself
-const WALL_DAMPING = 0.5;
-const HEARING_GAIN = 0.12;   // alertness gained per pixel the ring overshoots the monster
+const WALL_DAMPING = 0.6;       // each wall a sound passes through
+const DOOR_DAMPING = 0.75;      // a closed door muffles less than a wall
+// Every sound adds some alertness wherever it happens. Loudness is the
+// ring radius after walls have muffled it; it falls off with distance but
+// never quite to zero, so noise anywhere in the house adds up.
+const HEARING_GAIN = 4;
+const NOTICE_GAIN = 1;       // an awake monster only goes to look at sounds this loud
 const NOISE_RING_TICKS = 24; // how long the client shows a ring
 
 // --- Monster -----------------------------------------------------------
 const MONSTER_SIZE = 44;
 const STIR_AT = 35;          // stops snoring, rolls over
 const WAKE_AT = 70;          // gets up to investigate
-const ALERT_DECAY = 0.08;
+const ALERT_DECAY = 0.03;
+// It sleeps lighter as the night drags on: alertness can't drop below a
+// floor that rises over time, so dawdling makes everything riskier
+const RESTLESS_PER_SECOND = 0.15;   // night 1; later nights rise faster
+const RESTLESS_MAX = 60;            // just short of waking on its own
 const BUMP_RANGE = 45;       // walking into a sleeping monster is a bad idea
 const VISION = 180;
 const CHASE_VISION = 260;
@@ -113,6 +127,17 @@ const LOOT_SPOTS = [
   { x: 250, y: 380 },
 ];
 
+// Loose floorboards are re-rolled every night and only visible in a
+// flashlight beam. Stepping on one creaks, however carefully you do it.
+const BOARD_SIZE = 30;
+const BOARDS_BASE = 8;              // plus BOARDS_PER_NIGHT each night
+const BOARDS_PER_NIGHT = 2;
+const DOORWAY_BOARD_CHANCE = 0.5;   // thresholds are the classic creaky spot
+const BOARD_SNEAK_RADIUS = 100;
+const BOARD_WALK_RADIUS = 400;
+const BOARD_RUN_RADIUS = 600;
+const PLAYER_SPAWN = { x: 180, y: 470, w: 120, h: 60 };
+
 // `loud` is added to every footstep radius while carrying it.
 // `slow` multiplies movement speed. Cheap and quiet vs. valuable and loud.
 const LOOT_POOL = [
@@ -132,6 +157,7 @@ const LOOT_PER_NIGHT = 7;
 // Each night the quota grows and the monster gets sharper
 function quotaFor(night) { return 300 + (night - 1) * 250; }
 function hearingFor(night) { return 1 + 0.15 * (night - 1); }
+function restlessFor(night) { return (RESTLESS_PER_SECOND / TICK_RATE) * (1 + 0.25 * (night - 1)); }
 function chaseSpeedFor(night) { return Math.min(4.0, 3.3 + 0.15 * (night - 1)); }
 function sleepwalkChanceFor(night) { return (night - 1) / (TICK_RATE * 45); }
 
@@ -141,6 +167,8 @@ const state = {
   players: {},
   monster: null,
   loot: [],
+  boards: [],
+  elapsed: 0, // ticks since the night started
   doors: DOORS.map((d) => ({ ...d, open: true })),
   noises: [],
   events: [],
@@ -201,6 +229,23 @@ function wallsBetween(a, b) {
     inWall = now;
   }
   return count;
+}
+
+// How much of a sound survives the trip from a to b. Every wall it
+// passes through takes a cut, closed doors less so.
+function soundDamping(a, b) {
+  const dist = Math.hypot(b.x - a.x, b.y - a.y);
+  const steps = Math.max(1, Math.ceil(dist / 6));
+  let factor = 1, inside = null;
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    const x = a.x + (b.x - a.x) * t, y = a.y + (b.y - a.y) * t;
+    const door = state.doors.find((d) => !d.open && insideZone(x, y, d));
+    const now = door ? "door" : WALLS.some((w) => insideZone(x, y, w)) ? "wall" : null;
+    if (now && now !== inside) factor *= now === "door" ? DOOR_DAMPING : WALL_DAMPING;
+    inside = now;
+  }
+  return factor;
 }
 
 function canSee(a, b, range) {
@@ -354,11 +399,44 @@ function spawnPlayer(p) {
   p.x = 180 + Math.random() * 120;
   p.y = 470 + Math.random() * 60;
   p.carrying = -1;
+  p.onBoard = -1;
   p.hidden = -1;
   p.hideSeen = false;
   p.caught = false;
   p.escaped = false;
   p.stepTimer = 0;
+}
+
+function overlapsAny(x, y, size, rects) {
+  return rects.some((r) => boxOverlaps(x, y, size, r));
+}
+
+function makeBoards(night, bed) {
+  const boards = [];
+  const keepClear = [EXIT, PLAYER_SPAWN, ...WALLS,
+    { x: bed.x - 50, y: bed.y - 50, w: 100, h: 100 },
+    ...HIDES.map((h) => ({ x: h.x - 25, y: h.y - 25, w: 50, h: 50 }))];
+  const free = (x, y) =>
+    !overlapsAny(x, y, BOARD_SIZE + 4, keepClear) &&
+    !boards.some((b) => Math.hypot(b.x - x, b.y - y) < BOARD_SIZE * 1.5);
+
+  // One side of a doorway, just past the door
+  for (const d of DOORS) {
+    if (Math.random() >= DOORWAY_BOARD_CHANCE) continue;
+    const c = doorCenter(d);
+    const side = Math.random() < 0.5 ? -1 : 1;
+    const x = d.h > d.w ? c.x + side * (d.w / 2 + BOARD_SIZE / 2 + 2) : c.x;
+    const y = d.h > d.w ? c.y : c.y + side * (d.h / 2 + BOARD_SIZE / 2 + 2);
+    if (free(x, y)) boards.push({ x, y });
+  }
+
+  const target = boards.length + BOARDS_BASE + BOARDS_PER_NIGHT * (night - 1);
+  for (let tries = 0; boards.length < target && tries < 500; tries++) {
+    const x = 20 + Math.random() * (W - 40);
+    const y = 20 + Math.random() * (H - 40);
+    if (free(x, y)) boards.push({ x, y });
+  }
+  return boards.map((b) => ({ ...b, size: BOARD_SIZE }));
 }
 
 function startNight(night) {
@@ -380,6 +458,8 @@ function startNight(night) {
   };
   for (const d of state.doors) d.open = Math.random() >= DOOR_CLOSED_CHANCE;
   state.loot = items.map((item, i) => ({ ...item, ...spots[i], carriedBy: null, secured: false }));
+  state.boards = makeBoards(night, bed);
+  state.elapsed = 0;
   for (const id in state.players) spawnPlayer(state.players[id]);
 }
 
@@ -421,14 +501,14 @@ function makeNoise(x, y, radius) {
   state.noises.push({ x, y, r: radius, age: 0 });
 
   const m = state.monster;
-  const effective = radius * Math.pow(WALL_DAMPING, wallsBetween({ x, y }, m));
+  const loudness = radius * soundDamping({ x, y }, m);
   const dist = Math.hypot(m.x - x, m.y - y);
-  if (dist >= effective) return;
+  const gain = HEARING_GAIN * (loudness / 100) * (loudness / (loudness + dist)) * hearingFor(state.night);
 
   if (m.status === "SLEEPING" || m.status === "STIRRING") {
-    m.alert += (effective - dist) * HEARING_GAIN * hearingFor(state.night);
+    m.alert += gain;
     m.target = { x, y };
-  } else if (m.status !== "CHASING") {
+  } else if (m.status !== "CHASING" && gain >= NOTICE_GAIN) {
     m.status = "INVESTIGATING";
     m.target = { x, y };
   }
@@ -490,7 +570,8 @@ function updateMonster() {
       m.alert += 3;
       m.target = { x: p.x, y: p.y };
     }
-    m.alert = Math.max(0, m.alert - ALERT_DECAY);
+    const floor = Math.min(RESTLESS_MAX, state.elapsed * restlessFor(state.night));
+    m.alert = Math.max(floor, m.alert - ALERT_DECAY);
 
     if (m.alert >= WAKE_AT) {
       m.status = "INVESTIGATING";
@@ -529,7 +610,7 @@ function updateMonster() {
       moveMonsterTowards(m.home, RETURN_SPEED);
       if (Math.hypot(m.home.x - m.x, m.home.y - m.y) < 4) {
         m.status = "SLEEPING";
-        m.alert = 30; // groggy, easier to wake again
+        m.alert = Math.max(m.alert, 40); // groggy, easier to wake again
       }
       break;
 
@@ -595,7 +676,8 @@ function updatePlayer(p) {
   }
 
   const item = p.carrying !== -1 ? state.loot[p.carrying] : null;
-  const speed = (k.run ? RUN_SPEED : WALK_SPEED) * (item ? item.slow : 1);
+  const gait = k.run ? "run" : k.sneak ? "sneak" : "walk";
+  const speed = { sneak: SNEAK_SPEED, walk: WALK_SPEED, run: RUN_SPEED }[gait] * (item ? item.slow : 1);
 
   // Running into a closed door bursts it open. Walking into one doesn't.
   const bump = () => {
@@ -612,13 +694,28 @@ function updatePlayer(p) {
   if (k.down) p.y += speed;
   if (boxHitsWalls(p.x, p.y, PLAYER_SIZE)) { bump(); p.y = oldY; }
 
+  const extra = item ? item.loud : 0;
   if (moving) {
     p.stepTimer++;
-    if (p.stepTimer >= (k.run ? RUN_STEP_EVERY : WALK_STEP_EVERY)) {
+    const every = { sneak: SNEAK_STEP_EVERY, walk: WALK_STEP_EVERY, run: RUN_STEP_EVERY }[gait];
+    if (p.stepTimer >= every) {
       p.stepTimer = 0;
-      makeNoise(p.x, p.y, (k.run ? RUN_STEP_RADIUS : WALK_STEP_RADIUS) + (item ? item.loud : 0));
+      const r = { sneak: SNEAK_STEP_RADIUS, walk: WALK_STEP_RADIUS, run: RUN_STEP_RADIUS }[gait];
+      makeNoise(p.x, p.y, r + extra);
     }
   }
+
+  // Creaks once as you step onto a loose board
+  const board = state.boards.findIndex((b) =>
+    Math.abs(p.x - b.x) < b.size / 2 && Math.abs(p.y - b.y) < b.size / 2
+  );
+  if (board !== -1 && board !== p.onBoard) {
+    const b = state.boards[board];
+    const r = { sneak: BOARD_SNEAK_RADIUS, walk: BOARD_WALK_RADIUS, run: BOARD_RUN_RADIUS }[gait];
+    makeNoise(b.x, b.y, r + extra);
+    state.events.push({ type: "board", gait, x: b.x, y: b.y });
+  }
+  p.onBoard = board;
 
   if (item) {
     item.x = p.x;
@@ -631,6 +728,7 @@ function tick() {
   state.noises = state.noises.filter((n) => n.age < NOISE_RING_TICKS);
   if (state.gameOver) return;
 
+  state.elapsed++;
   for (const id in state.players) updatePlayer(state.players[id]);
   updateMonster();
 }
@@ -760,6 +858,7 @@ setInterval(() => {
     }])),
     monster: { x: m.x, y: m.y, status: m.status },
     loot: state.loot,
+    boards: state.boards,
     doors: state.doors,
     noises: state.noises,
     events: state.events,

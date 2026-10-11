@@ -105,10 +105,18 @@
       // A creak is a hinge sticking and slipping: a raspy buzz whose rate
       // wobbles upward. The monster's is slower, deeper and longer.
       creak(volume, deep = false) {
+        if (deep) this.rasp(volume, 16, 650, 1.3);
+        else this.rasp(volume, 28, 1400, 0.6);
+      },
+
+      // Floorboards groan lower and shorter than a hinge
+      floorCreak(volume) {
+        this.rasp(volume, 22, 900, 0.45);
+      },
+
+      rasp(volume, base, band, length) {
         if (!this.ctx) return;
         const t = this.ctx.currentTime;
-        const length = deep ? 1.3 : 0.6;
-        const base = deep ? 16 : 28;
         const curve = new Float32Array(24);
         for (let i = 0; i < curve.length; i++) {
           const k = i / (curve.length - 1);
@@ -117,9 +125,9 @@
         const osc = this.ctx.createOscillator();
         osc.type = "sawtooth";
         osc.frequency.setValueCurveAtTime(curve, t, length);
-        const band = this.filter("bandpass", deep ? 650 : 1400, 3);
-        osc.connect(band);
-        band.connect(this.envelope(volume, 0.05, length));
+        const bandpass = this.filter("bandpass", band, 3);
+        osc.connect(bandpass);
+        bandpass.connect(this.envelope(volume, 0.05, length));
         osc.start(t);
         osc.stop(t + length + 0.1);
       },
@@ -170,7 +178,7 @@
 
     class GameScene extends Phaser.Scene {
       create() {
-        this.keys = this.input.keyboard.addKeys("W,A,S,D,UP,DOWN,LEFT,RIGHT,SHIFT,R,E,L");
+        this.keys = this.input.keyboard.addKeys("W,A,S,D,UP,DOWN,LEFT,RIGHT,SHIFT,SPACE,R,E,L");
         this.input.keyboard.on("keydown", () => sfx.init());
 
         this.state = null;
@@ -194,6 +202,8 @@
 
         // Depth layers: world (0-10) < darkness (20) < what you can always
         // perceive: walls, sounds (25-30) < HUD (40)
+        this.boards = this.add.graphics().setDepth(3);
+        this.boardsKey = "";
         this.monster = this.add.rectangle(0, 0, 44, 44, 0x8e1b1b).setDepth(10);
         this.monsterEyes = this.add.text(0, 0, "◉ ◉", { fontSize: "12px", color: "#ff5252" }).setOrigin(0.5).setDepth(10);
         this.darkness = this.add.renderTexture(0, 0, 800, 600).setOrigin(0, 0).setDepth(20);
@@ -202,7 +212,7 @@
 
         this.hud = this.add.text(12, 12, "", { fontSize: "15px", color: "#ddd", backgroundColor: "#000a", padding: { x: 6, y: 4 } }).setDepth(40);
         this.status = this.add.text(788, 12, "", { fontSize: "15px", color: "#ffeb3b", backgroundColor: "#000a", padding: { x: 6, y: 4 }, align: "right" }).setOrigin(1, 0).setDepth(40);
-        this.add.text(400, 588, "WASD walk · Shift run (loud) · E door / grab / drop / hide · L leave from the exit", { fontSize: "12px", color: "#777" }).setOrigin(0.5, 1).setDepth(40);
+        this.add.text(400, 588, "WASD walk · Space sneak · Shift run · E door / grab / drop / hide · L leave from the exit", { fontSize: "12px", color: "#777" }).setOrigin(0.5, 1).setDepth(40);
         this.bigText = this.add.text(400, 280, "", { fontSize: "34px", color: "#fff", align: "center", backgroundColor: "#000c", padding: { x: 16, y: 12 } }).setOrigin(0.5).setDepth(40).setVisible(false);
         this.flash = this.add.rectangle(0, 0, 800, 600, 0xb71c1c, 0).setOrigin(0, 0).setDepth(35);
 
@@ -302,6 +312,7 @@
         this.zzz.setPosition(m.x + 18, m.y - 34);
         this.zzz.setText(m.status === "SLEEPING" ? "z z Z" : m.status === "STIRRING" ? "hnngh..." : "");
 
+        this.drawBoards(state.boards);
         state.doors.forEach((d, i) => {
           this.doorSprites[i].closed.setVisible(!d.open);
           this.doorSprites[i].open.setVisible(d.open);
@@ -313,8 +324,30 @@
 
       // Door sounds fade with distance from you, so a far-off creak in the
       // dark is the only warning you get
+      // Re-rolled every night; only redrawn when they change
+      drawBoards(boards) {
+        const key = boards.map((b) => `${b.x | 0},${b.y | 0}`).join(";");
+        if (key === this.boardsKey) return;
+        this.boardsKey = key;
+        const g = this.boards;
+        g.clear();
+        for (const b of boards) {
+          const x = b.x - b.size / 2, y = b.y - b.size / 2;
+          g.fillStyle(0x4a3524, 1).fillRect(x, y, b.size, b.size);
+          g.lineStyle(1, 0x1e140c, 1);
+          for (let i = 1; i < 3; i++) g.lineBetween(x, y + (b.size * i) / 3, x + b.size, y + (b.size * i) / 3);
+          g.lineStyle(1, 0x7a5a3c, 1).strokeRect(x, y, b.size, b.size);
+        }
+      }
+
       handleEvent(ev) {
-        if (ev.type === "door") {
+        if (ev.type === "board") {
+          const me = this.state.players[socket.id];
+          const dist = me ? Math.hypot(ev.x - me.x, ev.y - me.y) : 0;
+          const near = Math.max(0.05, 1 - dist / 700);
+          const loud = { sneak: 0.12, walk: 0.35, run: 0.6 }[ev.gait];
+          sfx.floorCreak(loud * near);
+        } else if (ev.type === "door") {
           const me = this.state.players[socket.id];
           const dist = me ? Math.hypot(ev.x - me.x, ev.y - me.y) : 0;
           const near = Math.max(0.05, 1 - dist / 700);
@@ -463,6 +496,7 @@
           left: k.A.isDown || k.LEFT.isDown,
           right: k.D.isDown || k.RIGHT.isDown,
           run: k.SHIFT.isDown,
+          sneak: k.SPACE.isDown,
           aim: this.aim,
         });
         if (Phaser.Input.Keyboard.JustDown(k.E)) socket.emit("interact");
