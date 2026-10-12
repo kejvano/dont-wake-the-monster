@@ -308,7 +308,8 @@
         this.monsterEyes.setPosition(m.x, m.y - 6);
         const asleep = m.status === "SLEEPING" || m.status === "STIRRING";
         this.monsterEyes.setText(asleep ? "— —" : "◉ ◉");
-        // The snoring tells you where it is. When it stops, you don't know.
+        // Only shown while it's lit (see drawDarkness). In the dark, the
+        // snoring sound is all you have to go on.
         this.zzz.setPosition(m.x + 18, m.y - 34);
         this.zzz.setText(m.status === "SLEEPING" ? "z z Z" : m.status === "STIRRING" ? "hnngh..." : "");
 
@@ -390,6 +391,7 @@
         this.darkness.clear();
         this.darkness.fill(0x000000, DARKNESS);
         const blockers = state.walls.concat(state.doors.filter((d) => !d.open));
+        let monsterLit = false;
         for (const [id, p] of Object.entries(state.players)) {
           if (p.escaped) continue;
           const glow = p.caught ? GHOST_LIGHT_RADIUS : GLOW_RADIUS;
@@ -397,8 +399,10 @@
           this.darkness.erase(this.glowBrush, p.x, p.y);
 
           // Ghosts and hiding players have their flashlight off
-          if (p.caught || p.hidden !== -1) continue;
+          const beamOn = !p.caught && p.hidden === -1;
           const aim = id === socket.id ? this.aim : p.aim;
+          monsterLit ||= this.monsterLitBy(p, glow, beamOn ? aim : null, blockers);
+          if (!beamOn) continue;
           this.lightLayer.clear();
           this.coneBrush.setRotation(aim);
           this.lightLayer.draw(this.coneBrush, p.x, p.y);
@@ -406,6 +410,25 @@
           this.lightLayer.erase(this.shadows, 0, 0);
           this.darkness.erase(this.lightLayer, 0, 0);
         }
+        // You only see what it's up to once someone gets light on it
+        this.zzz.setVisible(monsterLit);
+      }
+
+      // Whether any part of the monster is inside this player's glow or
+      // their flashlight beam (aim is null when the beam is off)
+      monsterLitBy(p, glow, aim, blockers) {
+        const m = this.state.monster;
+        const e = 18; // a bit inside its edges
+        const points = [[0, 0], [-e, -e], [e, -e], [-e, e], [e, e]];
+        return points.some(([ox, oy]) => {
+          const dx = m.x + ox - p.x, dy = m.y + oy - p.y;
+          const dist = Math.hypot(dx, dy);
+          if (dist <= glow) return true;
+          if (aim === null || dist > this.flashlight.range) return false;
+          const off = Math.abs(Phaser.Math.Angle.Wrap(Math.atan2(dy, dx) - aim));
+          if (off > this.flashlight.halfAngle) return false;
+          return castRay(blockers, p.x, p.y, dx / dist, dy / dist, dist) >= dist;
+        });
       }
 
       // Casts rays across the cone. Wherever a ray hits a wall before the
